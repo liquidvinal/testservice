@@ -1,0 +1,227 @@
+import java.text.SimpleDateFormat
+import org.forbes.utils.GCloudConfig
+import org.forbes.utils.Utilities
+
+script {
+    appName = 'asim' // <------- Your project's name
+    gitRepo = 'https://github.com/liquidvinal/testservice.git' // <------- Your project's github URL ( Please make sure that it ends with .git )
+    teamName = 'asim' // <------- The name of the team who will manage this application
+
+    //Environment types
+    environmentPresetsMap = [
+        'STAGING': 'STAGING',
+        'DEV': 'DEV',
+        'PRODUCTION': 'PRODUCTION',
+    ]
+
+    //The options below are the most common
+    def productionEnvironmentMap = [
+        'PROD': [
+            'env': environmentPresetsMap['PRODUCTION'],
+            'cloud-provider': 'GCP',
+            'label': "${appName}-production",
+            'maxReplicas': 1,
+            'minReplicas': 1,
+            'vaultAuthPath': '/auth/production-__Cluster__/',
+            'vaultSecretApp': "kv/data/${teamName}/${appName}/production",
+            'vaultSecretCommon': "kv/data/${teamName}/common/production",
+        ],
+    ]
+
+    def devEnvironmentMap = [
+        'DEV': [
+            'env': environmentPresetsMap['DEV'],
+            'cloud-provider': 'GCP',
+        ],
+        'STAGE': [
+            'label':  "${appName}-staging",
+            'env': environmentPresetsMap['STAGING'],
+            'cloud-provider': 'GCP',
+            'maxReplicas': 1,
+            'minReplicas': 1,
+            'vaultAuthPath': '/auth/development-__Cluster__/',
+            'vaultSecretApp': "kv/data/${teamName}/${appName}/staging",
+            'vaultSecretCommon': "kv/data/${teamName}/common/staging",
+        ]
+    ]
+
+    //To know which options and alternatives to use
+    if (scm.getUserRemoteConfigs()[0].getName() == 'production') {
+        environmentMap = productionEnvironmentMap
+    } else {
+        environmentMap = devEnvironmentMap
+    }
+}
+
+pipeline {
+
+    agent {
+        node {
+                label 'MainWorker' // <------- The name of your jenkins worker
+        }
+    }
+
+    environment {
+        buildEnvironment = getOption(params.ENV_TARGET, environmentMap, true, 'buildEnvironment')
+        buildEnvironmentType = useOrReplaceDefault(params.ENV_TYPE, getOption('env', buildEnvironment), 'Auto-Detect', 'buildEnvironmentType')
+        buildLabel = useOrReplaceDefault(getOption('label', buildEnvironment), params.PR_LABEL, '', 'buildLabel')
+        cloudProvider = getOption('cloud-provider', buildEnvironment, true, 'cloudProvider')
+    }
+
+    parameters {
+        string(name: 'BRANCH', defaultValue: 'main', description: 'Branch to build')
+        choice(name: 'ENV_TARGET', choices: generateEnvParamList(['**Pick One**'], environmentMap), description: 'Environment to build and deploy')
+        choice(name: 'ENV_TYPE', choices: generateEnvParamList(['Auto-Detect'], environmentPresetsMap), description: 'Environment type to build for. Influences whether production or staging data is used.')
+        string(name: 'PR_LABEL', defaultValue: '', description: 'ADVANCED: Unique label for identifying existing build of this instance')
+        string(name: 'REQUEST_ID', defaultValue: '', description: 'ADVANCED: Unique identifier for this specific build. Used for automated deployment management')
+        string(name: 'PREFERRED_DEPLOYMENT', defaultValue: '', description: 'ADVANCED: Preferred deployment ID for this build. Will ignore if existing or unavailable')
+        string(name: 'DOCKER_IMAGE', defaultValue: '', description: 'ADVANCED: Docker image to use for this deployment - Avoid build')
+        string(name: 'VARIANT_NAMESPACE', defaultValue: 'default', description: 'ADVANCED: Library cloud configuration variant to use for this deployment')
+    }
+
+    options {
+		buildDiscarder(logRotator(numToKeepStr: '30')) // |
+                                                       // | <------- These are the default configuration of your jenkins job
+		ansiColor('xterm')                             // |
+	}
+
+    stages{
+
+        stage ('Prepare Workspace') {  // <------- Feel free to rename this stage as you like
+            steps {
+                cloneRepo(gitRepo, params.BRANCH) //The Branch here, is the param variable defined above (like shown in the example above)
+                generateArtifactoryCredentials()
+            }
+        }
+
+        stage ('Build') {  // <------- Feel free to rename this stage as you like
+            environment {
+                    info = readJSON(file:'package-data.json')
+                    version = "${info['codename']}-v${info['version']}"
+                    commitInfo = sh(
+                        script: 'git log -1 --pretty=\'format:%an at %ai, commit %H\'',
+                        returnStdout: true
+                    )
+                    buildTimestamp = "${(new SimpleDateFormat('yyyy-MM-dd HH:mm:ss Z')).format(new Date())}"
+                }
+                steps {
+                    script {
+                        if ((!DOCKER_IMAGE || DOCKER_IMAGE == '') || !DOCKER_IMAGE.startsWith(appName)) {
+                            sh 'docker build ' +
+                                '-t ' + appName + ' ' +
+                                '--build-arg env_target=' + ENV_TARGET + ' ' +
+                                '--build-arg env_type=' + buildEnvironmentType + ' ' +
+                                '--build-arg env_branch=' + BRANCH + ' ' +
+                                '--build-arg env_build_info="' + commitInfo + '" ' +
+                                '--build-arg env_build_time="' + buildTimestamp + '" ' + ' .'
+
+
+                            imageName = "${appName}:${version}.${BUILD_NUMBER}"
+
+                        } else {
+                            imageName = DOCKER_IMAGE
+                        }
+                    }
+                }
+
+        }
+
+        stage ('GCP Deploy') {  // <------- Feel free to rename this stage as you like
+            when {
+                    environment name: 'cloudProvider', value: 'GCP'
+                }
+            steps {
+                    initializeGCloud()
+                    initializeGCloud(params.VARIANT_NAMESPACE)
+                    configureHelm('default', ["enableHelm3": true])
+                    sh 'gcloud auth configure-docker'
+                    script {
+                        def config = GCloudConfig.getVariant(this, params.VARIANT_NAMESPACE)
+                        imageName = "us.gcr.io/${config.project}/${imageName}"
+
+                        if ((!DOCKER_IMAGE || DOCKER_IMAGE == '') || !DOCKER_IMAGE.startsWith(appName)) {
+                            sh "docker tag ${appName}:latest ${imageName}"
+                            sh "docker push ${imageName}"
+                        }
+                    }
+                    script {
+                        deployGCloud([
+                            "image": imageName,
+                            "namespace": params.VARIANT_NAMESPACE,
+                            "chart": "${appName}-helm-chart",
+                            "values": [
+                                "metaLabel": buildLabel,
+                                "preferredDeploymentPreset": params.PREFERRED_DEPLOYMENT,
+                                "deploymentId": "#existingOrNextAvailable#",
+                                "maxReplicas": useOrReplaceDefault(getOption('maxReplicas', environmentMap[ENV_TARGET]), #, '', 'maxReplicas'), // <------- # depends on the application
+                                "minReplicas": useOrReplaceDefault(getOption('minReplicas', environmentMap[ENV_TARGET]), #, '', 'minReplicas'), // <------- # depends on the application
+                                "resourceCpuLimit": useOrReplaceDefault(getOption('resourceCpuLimit', environmentMap[ENV_TARGET]), '#', '', 'resourceCpuLimit'), // <------- # depends on the application
+                                "resourceCpuRequest": useOrReplaceDefault(getOption('resourceCpuRequest', environmentMap[ENV_TARGET]), '#', '', 'resourceCpuRequest'), // <------- # depends on the application
+                                "resourceMemoryLimit": useOrReplaceDefault(getOption('resourceMemoryLimit', environmentMap[ENV_TARGET]), '#', '', 'resourceMemoryLimit'), // <------- # depends on the application
+                                "resourceMemoryRequest": useOrReplaceDefault(getOption('resourceMemoryRequest', environmentMap[ENV_TARGET]), '#', '', 'resourceMemoryRequest'), // <------- # depends on the application
+                                "appName": "${appName}",
+                                "vaultRole": "${appName}",
+                                "vaultAuthPath": useOrReplaceDefault(getOption('vaultAuthPath', environmentMap[ENV_TARGET]), '', '', 'vaultAuthPath'),
+                                "vaultSecretApp": useOrReplaceDefault(getOption('vaultSecretApp', environmentMap[ENV_TARGET]), '', '', 'vaultSecretApp'),
+                                "vaultSecretCommon": useOrReplaceDefault(getOption('vaultSecretCommon', environmentMap[ENV_TARGET]), '', '', 'vaultSecretCommon'),
+                            ],
+                            "environments": environmentMap,
+                            "environmentTarget": params.ENV_TARGET,
+                            "requestId": REQUEST_ID,
+                            "apiVersion": 3,
+                            "enableHelm3": true,
+                        ])
+                    }
+                }
+
+            }
+
+        }
+
+        post {
+                always {
+                    logoutGCloud()
+                    logoutHelm('default', ["enableHelm3": true])
+                }
+                aborted {
+                    script {
+                            if (REQUEST_ID != '') {
+                                build(
+                                    job: "${appName}-destroy-deployment",
+                                    parameters: [
+                                        [$class: 'StringParameterValue', name: 'PR_LABEL', value: PR_LABEL],
+                                        [$class: 'StringParameterValue', name: 'REQUEST_ID', value: REQUEST_ID],
+                                        [$class: 'StringParameterValue', name: 'ACTION', value: 'create'],
+                                        [$class: 'StringParameterValue', name: 'NAMESPACE', value: VARIANT_NAMESPACE],
+                                        [$class: 'BooleanParameterValue', name: 'SUCCESS', value: false],
+                                    ],
+                                    propagate: false,
+                                    wait: false
+                                )
+                            }
+                        }
+                        echo 'Build aborted! Running post steps...'
+                }
+
+                failure{
+                    script {
+                            if (REQUEST_ID != '') {
+                                build(
+                                    job: "${appName}-destroy-deployment",
+                                    parameters: [
+                                        [$class: 'StringParameterValue', name: 'PR_LABEL', value: PR_LABEL],
+                                        [$class: 'StringParameterValue', name: 'REQUEST_ID', value: REQUEST_ID],
+                                        [$class: 'StringParameterValue', name: 'ACTION', value: 'create'],
+                                        [$class: 'StringParameterValue', name: 'NAMESPACE', value: VARIANT_NAMESPACE],
+                                        [$class: 'BooleanParameterValue', name: 'SUCCESS', value: false],
+                                    ],
+                                    propagate: false,
+                                    wait: false
+                                )
+                            }
+                        }
+                        echo 'Build failed! Running post steps...'
+                }
+        }
+
+}
